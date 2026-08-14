@@ -519,6 +519,23 @@ st.set_page_config(
     page_title="Buffett Value Calculator", page_icon="📈", layout="wide"
 )
 
+# --- INJECT CUSTOM CSS FOR FLOATING / STICKY TABLE HEADERS ---
+st.markdown(
+    """
+    <style>
+    /* Pin and float DataFrame headers */
+    div[data-testid="stDataFrame"] div[role="columnheader"],
+    div[data-testid="stDataFrame"] [data-testid="stTable"] th {
+        position: sticky !important;
+        top: 0 !important;
+        z-index: 100 !important;
+        background-color: #1e293b !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 if "watchlists" not in st.session_state:
     st.session_state.watchlists = load_watchlists()
 

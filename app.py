@@ -189,29 +189,32 @@ def get_ex_dividend_info(stock: yf.Ticker) -> str:
 
 
 def get_dividend_yield(info: dict) -> float:
-    """Extracts annual dividend yield as a percentage, handling yfinance UK decimal/percentage discrepancies."""
+    """Extracts annual dividend yield as a percentage, reliably handling UK pence (GBX/GBp) vs pounds."""
     raw_yield = info.get("dividendYield")
-    
+    if raw_yield is not None:
+        if 0 < raw_yield < 0.30:
+            return round(raw_yield * 100, 2)
+        elif 0.30 <= raw_yield <= 50.0:
+            return round(raw_yield, 2)
+
     div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
     price = info.get("currentPrice") or info.get("regularMarketPrice")
-    fin_currency = info.get("financialCurrency", "")
+    fin_currency = str(info.get("financialCurrency", "")).upper()
+    symbol_is_uk = info.get("symbol", "").endswith(".L")
 
     if div_rate and price and price > 0:
-        # Properly check GBX pence vs GBP pounds
-        if fin_currency.upper() == "GBX" or price > 50:
-            price_in_pounds = price / 100.0
-        else:
-            price_in_pounds = price
+        if symbol_is_uk or fin_currency in ["GBX", "GBP"]:
+            calculated_yield = (div_rate / price) * 100
+            if 0.1 <= calculated_yield <= 50.0:
+                return round(calculated_yield, 2)
             
-        calculated_yield = (div_rate / price_in_pounds) * 100
-        if 0 < calculated_yield < 50:
-            return round(calculated_yield, 2)
-
-    if raw_yield is not None:
-        if raw_yield < 0.25:
-            return round(raw_yield * 100, 2)
-        elif raw_yield <= 25.0:
-            return round(raw_yield, 2)
+            calculated_yield_adjusted = ((div_rate * 100.0) / price) * 100
+            if 0.1 <= calculated_yield_adjusted <= 50.0:
+                return round(calculated_yield_adjusted, 2)
+        else:
+            calculated_yield = (div_rate / price) * 100
+            if 0.1 <= calculated_yield <= 50.0:
+                return round(calculated_yield, 2)
 
     return 0.00
 

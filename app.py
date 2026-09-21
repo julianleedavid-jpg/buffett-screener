@@ -2,7 +2,7 @@ import io
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import streamlit as st
@@ -219,6 +219,21 @@ def get_dividend_yield(info: dict) -> float:
     return 0.00
 
 
+def get_annual_price_change(stock: yf.Ticker) -> float | None:
+    """Calculates the 1-year trailing percentage change in share price."""
+    try:
+        hist = stock.history(period="1y")
+        if hist is not None and len(hist) >= 2:
+            start_price = hist["Close"].iloc[0]
+            end_price = hist["Close"].iloc[-1]
+            if start_price and start_price > 0:
+                pct_change = ((end_price - start_price) / start_price) * 100
+                return round(pct_change, 2)
+    except Exception:
+        pass
+    return None
+
+
 def get_pe_ratio(info: dict) -> float | None:
     """Extracts trailing or forward P/E ratio rounded to 2 decimal places."""
     pe = info.get("trailingPE") or info.get("forwardPE")
@@ -328,6 +343,8 @@ def calculate_buffett_value(
             "Buy Price": None,
             "Upside (%)": None,
             "Div Yield (%)": None,
+            "Annual Price Chg (%)": None,
+            "Current Revenue Pred (%)": None,
             "Ex-Div Date": "N/A",
             "Status": "ERROR (Rate-Limited/Unavailable)",
         }
@@ -343,6 +360,13 @@ def calculate_buffett_value(
 
     ex_div_date_str = get_ex_dividend_info(stock)
     div_yield_pct = get_dividend_yield(info)
+    annual_price_chg = get_annual_price_change(stock)
+    
+    # Calculate current revenue prediction (%): Annual Price Change + Dividend Yield
+    current_rev_pred = None
+    if annual_price_chg is not None and div_yield_pct is not None:
+        current_rev_pred = round(annual_price_chg + div_yield_pct, 2)
+
     pe_ratio = get_pe_ratio(info)
     roe = get_return_on_equity(info)
 
@@ -372,6 +396,8 @@ def calculate_buffett_value(
             "Buy Price": None,
             "Upside (%)": None,
             "Div Yield (%)": div_yield_pct,
+            "Annual Price Chg (%)": annual_price_chg,
+            "Current Revenue Pred (%)": current_rev_pred,
             "Ex-Div Date": ex_div_date_str,
             "Status": "ERROR (Missing Price/Shares)",
         }
@@ -429,6 +455,8 @@ def calculate_buffett_value(
             "Buy Price": None,
             "Upside (%)": None,
             "Div Yield (%)": div_yield_pct,
+            "Annual Price Chg (%)": annual_price_chg,
+            "Current Revenue Pred (%)": current_rev_pred,
             "Ex-Div Date": ex_div_date_str,
             "Status": "N/A (Data Unavailable)",
         }
@@ -485,6 +513,8 @@ def calculate_buffett_value(
         "Buy Price": buy_price,
         "Upside (%)": upside,
         "Div Yield (%)": div_yield_pct,
+        "Annual Price Chg (%)": annual_price_chg,
+        "Current Revenue Pred (%)": current_rev_pred,
         "Ex-Div Date": ex_div_date_str,
         "Status": status,
     }
@@ -514,19 +544,32 @@ def render_valuation_table(df):
         "Buy Price": "{:.2f}",
         "Upside (%)": "{:.2f}",
         "Div Yield (%)": "{:.2f}",
+        "Annual Price Chg (%)": "{:.2f}",
+        "Current Revenue Pred (%)": "{:.2f}",
     }
 
     styled_df = df.style.format(format_dict, na_rep="N/A").map(color_status, subset=["Status"])
     st.dataframe(styled_df, use_container_width=True, height=750)
 
-    # --- Display Average Dividend Yield at the end of the table ---
+    # --- Display Summary Metrics at the end of the table ---
+    col_m1, col_m2 = st.columns(2)
+    
     if "Div Yield (%)" in df.columns:
         valid_yields = pd.to_numeric(df["Div Yield (%)"], errors="coerce").dropna()
         if not valid_yields.empty:
             avg_div_yield = valid_yields.mean()
-            st.metric(
+            col_m1.metric(
                 label="Average Dividend Yield (Scanned Universe)",
                 value=f"{avg_div_yield:.2f}%"
+            )
+
+    if "Current Revenue Pred (%)" in df.columns:
+        valid_rev_preds = pd.to_numeric(df["Current Revenue Pred (%)"], errors="coerce").dropna()
+        if not valid_rev_preds.empty:
+            total_rev_pred = valid_rev_preds.mean()  # Or sum depending on portfolio approach; mean represents the aggregate index/watchlist performance rate
+            col_m2.metric(
+                label="Average Current Revenue Prediction (Scanned Universe)",
+                value=f"{total_rev_pred:.2f}%"
             )
 
 
@@ -634,7 +677,7 @@ with tab1:
         curr = val["Currency"]
         st.subheader(f"{val['Company']} ({val['Ticker']}) — Sector: {val['Sector']}")
 
-        col1, col2, col3, col4, col5, col6, col7, col8, col9, col10 = st.columns(10)
+        col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12 = st.columns(12)
         col1.metric(
             "Current Price",
             f"{curr}{val['Price']:.2f}" if val["Price"] is not None else "N/A",
@@ -663,7 +706,9 @@ with tab1:
             f"{curr}{val['Buy Price']:.2f}" if val["Buy Price"] is not None else "N/A",
         )
         col9.metric("Annual Div Yield", f"{val['Div Yield (%)']:.2f}%" if isinstance(val["Div Yield (%)"], (int, float)) else "N/A")
-        col10.metric("Ex-Dividend Date", val["Ex-Div Date"])
+        col10.metric("1Y Price Chg", f"{val['Annual Price Chg (%)']:.2f}%" if isinstance(val["Annual Price Chg (%)"], (int, float)) else "N/A")
+        col11.metric("Revenue Pred", f"{val['Current Revenue Pred (%)']:.2f}%" if isinstance(val["Current Revenue Pred (%)"], (int, float)) else "N/A")
+        col12.metric("Ex-Div Date", val["Ex-Div Date"])
 
         st.divider()
 

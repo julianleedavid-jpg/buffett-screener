@@ -513,6 +513,16 @@ def render_valuation_table(df):
     styled_df = df.style.format(format_dict, na_rep="N/A").map(color_status, subset=["Status"])
     st.dataframe(styled_df, use_container_width=True, height=750)
 
+    # --- ADDED: Display Average Dividend Yield at the end of the table ---
+    if "Div Yield (%)" in df.columns:
+        valid_yields = pd.to_numeric(df["Div Yield (%)"], errors="coerce").dropna()
+        if not valid_yields.empty:
+            avg_div_yield = valid_yields.mean()
+            st.metric(
+                label="Average Dividend Yield (Scanned Universe)",
+                value=f"{avg_div_yield:.2f}%"
+            )
+
 
 # --- STREAMLIT UI SETUP ---
 st.set_page_config(

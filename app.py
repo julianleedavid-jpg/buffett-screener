@@ -12,7 +12,7 @@ import yfinance as yf
 WATCHLIST_FILE = "watchlist.json"
 
 DEFAULT_WATCHLISTS = {
-    "Main Watchlist": ["AAPL", "MSFT", "SHEL.L", "LLOY.L", "UKW.L", "BLND.L", "RIO.L"],
+    "Main Watchlist": ["AAPL", "MSFT", "SHEL.L", "LLOY.L", "UKW.L", "BLND.L", "RIO.L", "DUKE.L"],
 }
 
 
@@ -50,7 +50,7 @@ def get_live_ftse100_tickers() -> list:
             f"Could not fetch live FTSE 100 list dynamically ({e}). Using fallback list."
         )
 
-    return ["SHEL.L", "AZN.L", "HSBA.L", "BP.L", "GSK.L", "LLOY.L", "ULVR.L", "RIO.L"]
+    return ["SHEL.L", "AZN.L", "HSBA.L", "BP.L", "GSK.L", "LLOY.L", "ULVR.L", "RIO.L", "DUKE.L"]
 
 
 # --- DYNAMIC S&P 500 FETCHING ---
@@ -194,11 +194,17 @@ def get_dividend_yield(info: dict) -> float:
     
     div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
     price = info.get("currentPrice") or info.get("regularMarketPrice")
+    fin_currency = info.get("financialCurrency", "")
 
     if div_rate and price and price > 0:
-        price_in_pounds = price / 100.0 if price > 50 else price
+        # Properly check GBX pence vs GBP pounds
+        if fin_currency.upper() == "GBX" or price > 50:
+            price_in_pounds = price / 100.0
+        else:
+            price_in_pounds = price
+            
         calculated_yield = (div_rate / price_in_pounds) * 100
-        if 0 < calculated_yield < 25:
+        if 0 < calculated_yield < 50:
             return round(calculated_yield, 2)
 
     if raw_yield is not None:
@@ -340,7 +346,7 @@ def calculate_buffett_value(
     debt_ratio = get_debt_ratio(info, stock)
     debt_to_equity = get_debt_to_equity(info, stock)
 
-    # --- SHARES OUTSTANDING FALLBACK (Fixes RIO.L missing shares) ---
+    # --- SHARES OUTSTANDING FALLBACK ---
     shares_outstanding = info.get("sharesOutstanding")
     market_cap = info.get("marketCap")
     
@@ -367,7 +373,7 @@ def calculate_buffett_value(
             "Status": "ERROR (Missing Price/Shares)",
         }
 
-    # --- CASH FLOW & OWNER EARNINGS EXTRACTION WITH EXPANDED FALLBACKS ---
+    # --- CASH FLOW & OWNER EARNINGS EXTRACTION ---
     operating_cf = None
     capex = 0.0
 
@@ -379,11 +385,9 @@ def calculate_buffett_value(
         if raw_capex is not None:
             capex = abs(raw_capex)
 
-    # Fallback 1: Direct Free Cash Flow from info dict
     if operating_cf is None:
         operating_cf = info.get("freeCashflow") or info.get("operatingCashflow")
 
-    # Fallback 2: Comprehensive Net Income Search from Financials
     if operating_cf is None:
         try:
             financials = stock.financials
@@ -402,7 +406,6 @@ def calculate_buffett_value(
         except Exception:
             pass
 
-    # Fallback 3: EPS-based Owner Earnings (Trailing or Forward EPS)
     eps = info.get("trailingEps") or info.get("forwardEps")
     if operating_cf is None and eps:
         operating_cf = eps * shares_outstanding
@@ -513,7 +516,7 @@ def render_valuation_table(df):
     styled_df = df.style.format(format_dict, na_rep="N/A").map(color_status, subset=["Status"])
     st.dataframe(styled_df, use_container_width=True, height=750)
 
-    # --- ADDED: Display Average Dividend Yield at the end of the table ---
+    # --- Display Average Dividend Yield at the end of the table ---
     if "Div Yield (%)" in df.columns:
         valid_yields = pd.to_numeric(df["Div Yield (%)"], errors="coerce").dropna()
         if not valid_yields.empty:
@@ -607,7 +610,7 @@ with tab1:
     st.subheader("Analyze an Individual Stock")
     single_ticker = (
         st.text_input(
-            "Enter Ticker Symbol (e.g., AAPL, RIO.L, UKW.L, BLND.L)", value="RIO.L"
+            "Enter Ticker Symbol (e.g., AAPL, RIO.L, UKW.L, BLND.L, DUKE.L)", value="DUKE.L"
         )
         .strip()
         .upper()
@@ -732,7 +735,7 @@ with tab2:
 
     with col_add:
         new_ticker = (
-            st.text_input("Add Ticker to Active Watchlist (e.g., BP.L, MSFT)")
+            st.text_input("Add Ticker to Active Watchlist (e.g., BP.L, MSFT, DUKE.L)")
             .strip()
             .upper()
         )

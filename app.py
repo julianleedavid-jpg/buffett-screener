@@ -556,25 +556,45 @@ def render_valuation_table(df):
     styled_df = df.style.format(format_dict, na_rep="N/A").map(color_status, subset=["Status"])
     st.dataframe(styled_df, use_container_width=True, height=750)
 
-    # --- Display Summary Metrics at the end of the table ---
+    # --- Display Summary Metrics at the end of the table (Excluding missing/N/A entries) ---
     col_m1, col_m2 = st.columns(2)
     
     if "Div Yield (%)" in df.columns:
-        valid_yields = pd.to_numeric(df["Div Yield (%)"], errors="coerce").dropna()
+        valid_yield_df = df[
+            df["Div Yield (%)"].notna() & 
+            (df["Div Yield (%)"] != "N/A") & 
+            (df["Div Yield (%)"] != "")
+        ]
+        valid_yields = pd.to_numeric(valid_yield_df["Div Yield (%)"], errors="coerce").dropna()
         if not valid_yields.empty:
             avg_div_yield = valid_yields.mean()
             col_m1.metric(
                 label="Average Dividend Yield (Scanned Universe)",
                 value=f"{avg_div_yield:.2f}%"
             )
+        else:
+            col_m1.metric(
+                label="Average Dividend Yield (Scanned Universe)",
+                value="N/A"
+            )
 
     if "Current Revenue Pred (%)" in df.columns:
-        valid_rev_preds = pd.to_numeric(df["Current Revenue Pred (%)"], errors="coerce").dropna()
+        valid_rev_df = df[
+            df["Current Revenue Pred (%)"].notna() & 
+            (df["Current Revenue Pred (%)"] != "N/A") & 
+            (df["Current Revenue Pred (%)"] != "")
+        ]
+        valid_rev_preds = pd.to_numeric(valid_rev_df["Current Revenue Pred (%)"], errors="coerce").dropna()
         if not valid_rev_preds.empty:
             total_rev_pred = valid_rev_preds.mean()
             col_m2.metric(
                 label="Average Current Revenue Prediction (Scanned Universe)",
                 value=f"{total_rev_pred:.2f}%"
+            )
+        else:
+            col_m2.metric(
+                label="Average Current Revenue Prediction (Scanned Universe)",
+                value="N/A"
             )
 
 

@@ -219,18 +219,23 @@ def get_dividend_yield(info: dict) -> float:
     return 0.00
 
 
-def get_annual_price_change(stock: yf.Ticker) -> float | None:
-    """Calculates the 1-year trailing percentage change in share price."""
-    try:
-        hist = stock.history(period="1y")
-        if hist is not None and len(hist) >= 2:
-            start_price = hist["Close"].iloc[0]
-            end_price = hist["Close"].iloc[-1]
-            if start_price and start_price > 0:
-                pct_change = ((end_price - start_price) / start_price) * 100
-                return round(pct_change, 2)
-    except Exception:
-        pass
+def get_annual_price_change(stock: yf.Ticker, retries: int = 3, delay: float = 1.5) -> float | None:
+    """Calculates the 1-year trailing percentage change in share price with retry and backoff logic."""
+    for attempt in range(retries):
+        try:
+            hist = stock.history(period="1y")
+            if hist is not None and len(hist) >= 2:
+                start_price = hist["Close"].iloc[0]
+                end_price = hist["Close"].iloc[-1]
+                if start_price and start_price > 0:
+                    pct_change = ((end_price - start_price) / start_price) * 100
+                    return round(pct_change, 2)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "ratelimit" in err_msg or "429" in err_msg or "too many" in err_msg or "empty" in err_msg:
+                time.sleep(delay * (attempt + 1))
+            else:
+                time.sleep(delay)
     return None
 
 
@@ -566,7 +571,7 @@ def render_valuation_table(df):
     if "Current Revenue Pred (%)" in df.columns:
         valid_rev_preds = pd.to_numeric(df["Current Revenue Pred (%)"], errors="coerce").dropna()
         if not valid_rev_preds.empty:
-            total_rev_pred = valid_rev_preds.mean()  # Or sum depending on portfolio approach; mean represents the aggregate index/watchlist performance rate
+            total_rev_pred = valid_rev_preds.mean()
             col_m2.metric(
                 label="Average Current Revenue Prediction (Scanned Universe)",
                 value=f"{total_rev_pred:.2f}%"

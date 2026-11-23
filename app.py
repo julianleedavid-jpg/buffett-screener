@@ -193,88 +193,101 @@ def fetch_timeline_prices(
     return closes.dropna(how="all")
 
 
-# --- RATE-LIMIT RESILIENT DATA FETCHING ---
-def fetch_ticker_with_retry(
-    ticker_symbol: str, retries: int = 3, delay: float = 1.5
-):
-    """Fetches a yfinance Ticker object with retries and exponential backoff if rate-limited."""
-    for attempt in range(retries):
+# --- RESILIENT SNAPSHOT DATA FETCHING ---
+@st.cache_data(ttl=900)
+def fetch_ticker_snapshot(ticker_symbol: str):
+    """Fetches info, statements, and chart history with fallback when quoteSummary is rate-limited."""
+    ticker_symbol = ticker_symbol.strip().upper()
+    info = {}
+    cashflow_df = pd.DataFrame()
+    financials_df = pd.DataFrame()
+    bs_df = pd.DataFrame()
+    divs_series = pd.Series(dtype=float)
+    hist_df = pd.DataFrame()
+
+    # 1. Always fetch 1Y chart data via yf.download (reliable even when .info is 429'd)
+    try:
+        dl = yf.download(
+            ticker_symbol,
+            period="1y",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
+        if dl is not None and not dl.empty:
+            if isinstance(dl.columns, pd.MultiIndex):
+                dl.columns = dl.columns.get_level_values(0)
+            hist_df = dl
+    except Exception:
+        pass
+
+    # 2. Try quoteSummary (.info & statements) with backoff
+    for attempt in range(3):
         try:
             stock = yf.Ticker(ticker_symbol)
-            info = stock.info
-            if info:
-                return stock, info
+            raw_info = stock.info
+            if isinstance(raw_info, dict) and len(raw_info) > 1:
+                info = raw_info
+                try:
+                    cashflow_df = stock.cashflow
+                except Exception:
+                    pass
+                try:
+                    financials_df = stock.financials
+                except Exception:
+                    pass
+                try:
+                    q_bs = stock.quarterly_balance_sheet
+                    bs_df = (
+                        q_bs
+                        if isinstance(q_bs, pd.DataFrame) and not q_bs.empty
+                        else stock.balance_sheet
+                    )
+                except Exception:
+                    pass
+                try:
+                    divs_series = stock.dividends
+                except Exception:
+                    pass
+                break
         except Exception as e:
             err_msg = str(e).lower()
-            if "ratelimit" in err_msg or "429" in err_msg or "too many" in err_msg:
-                time.sleep(delay * (attempt + 1))
+            if (
+                "ratelimit" in err_msg
+                or "429" in err_msg
+                or "too many" in err_msg
+            ):
+                time.sleep(2.0 * (attempt + 1))
             else:
                 break
-    return None, {}
+
+    return info, cashflow_df, financials_df, bs_df, divs_series, hist_df
 
 
-def get_ex_dividend_info(stock: yf.Ticker) -> str:
-    """Returns upcoming ex-dividend date if future, checking calendar, info, events, or fallback."""
+def get_ex_dividend_info_from_data(info: dict, divs: pd.Series) -> str:
+    """Returns upcoming or last known ex-dividend date from cached snapshot data."""
     today = datetime.now().date()
-    candidate_date = None
-
-    try:
-        cal = stock.calendar
-        if isinstance(cal, dict) and "Ex-Dividend Date" in cal:
-            ex_date = cal["Ex-Dividend Date"]
-            if ex_date:
-                if isinstance(ex_date, (datetime, pd.Timestamp)):
-                    candidate_date = ex_date.date()
-                elif isinstance(ex_date, str):
-                    candidate_date = pd.to_datetime(ex_date).date()
-    except Exception:
-        pass
-
-    if not candidate_date:
+    ex_ts = info.get("exDividendDate")
+    if ex_ts:
         try:
-            ex_ts = stock.info.get("exDividendDate")
-            if ex_ts:
-                candidate_date = pd.to_datetime(ex_ts, unit="s").date()
-        except Exception:
-            pass
-
-    if not candidate_date:
-        try:
-            events = stock.events
-            if isinstance(events, pd.DataFrame) and not events.empty:
-                col = next(
-                    (
-                        c
-                        for c in ["Ex-Dividend Date", "Dividend Date"]
-                        if c in events.columns
-                    ),
-                    None,
-                )
-                if col:
-                    future_events = events[events.index.date >= today]
-                    if not future_events.empty:
-                        candidate_date = future_events.index[0].date()
-        except Exception:
-            pass
-
-    if candidate_date:
-        if candidate_date >= today:
-            return candidate_date.strftime("%Y-%m-%d")
-        else:
+            candidate_date = pd.to_datetime(ex_ts, unit="s").date()
+            if candidate_date >= today:
+                return candidate_date.strftime("%Y-%m-%d")
             return f"{candidate_date.strftime('%Y-%m-%d')} (Last Known)"
+        except Exception:
+            pass
 
-    try:
-        divs = stock.dividends
-        if not divs.empty:
+    if isinstance(divs, pd.Series) and not divs.empty:
+        try:
             last_date = divs.index[-1].date()
             return f"{last_date.strftime('%Y-%m-%d')} (Last Known)"
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     return "N/A"
 
 
-def get_dividend_yield(info: dict) -> float:
+def get_dividend_yield(info: dict, fallback_price: float | None = None) -> float:
     """Extracts annual dividend yield as a percentage, reliably handling UK pence (GBX/GBp) vs pounds."""
     raw_yield = info.get("dividendYield")
     if raw_yield is not None:
@@ -284,7 +297,11 @@ def get_dividend_yield(info: dict) -> float:
             return round(raw_yield, 2)
 
     div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    price = (
+        info.get("currentPrice")
+        or info.get("regularMarketPrice")
+        or fallback_price
+    )
     fin_currency = str(info.get("financialCurrency", "")).upper()
     symbol_is_uk = str(info.get("symbol", "")).endswith(".L")
 
@@ -305,33 +322,6 @@ def get_dividend_yield(info: dict) -> float:
     return 0.00
 
 
-def get_annual_price_change(
-    stock: yf.Ticker, retries: int = 3, delay: float = 1.5
-) -> float | None:
-    """Calculates the 1-year trailing percentage change in share price with retry and backoff logic."""
-    for attempt in range(retries):
-        try:
-            hist = stock.history(period="1y")
-            if hist is not None and len(hist) >= 2:
-                start_price = hist["Close"].iloc[0]
-                end_price = hist["Close"].iloc[-1]
-                if start_price and start_price > 0:
-                    pct_change = ((end_price - start_price) / start_price) * 100
-                    return round(pct_change, 2)
-        except Exception as e:
-            err_msg = str(e).lower()
-            if (
-                "ratelimit" in err_msg
-                or "429" in err_msg
-                or "too many" in err_msg
-                or "empty" in err_msg
-            ):
-                time.sleep(delay * (attempt + 1))
-            else:
-                time.sleep(delay)
-    return None
-
-
 def get_pe_ratio(info: dict) -> float | None:
     """Extracts trailing or forward P/E ratio rounded to 2 decimal places."""
     pe = info.get("trailingPE") or info.get("forwardPE")
@@ -350,13 +340,10 @@ def get_return_on_equity(info: dict) -> float | None:
     return None
 
 
-def get_debt_ratio(info: dict, stock: yf.Ticker) -> float | None:
+def get_debt_ratio(bs: pd.DataFrame) -> float | None:
     """Extracts Total Debt to Total Assets ratio from balance sheet if available."""
     try:
-        bs = stock.quarterly_balance_sheet
-        if bs.empty:
-            bs = stock.balance_sheet
-        if not bs.empty:
+        if isinstance(bs, pd.DataFrame) and not bs.empty:
             total_debt = None
             for key in ["Total Debt", "Short Long Term Debt", "Long Term Debt"]:
                 if key in bs.index:
@@ -374,8 +361,8 @@ def get_debt_ratio(info: dict, stock: yf.Ticker) -> float | None:
     return None
 
 
-def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
-    """Extracts Debt to Equity ratio, checking quarterly balance sheet as fallback."""
+def get_debt_to_equity(info: dict, bs: pd.DataFrame) -> float | None:
+    """Extracts Debt to Equity ratio, checking balance sheet as fallback."""
     dte = info.get("debtToEquity")
     if dte is not None:
         if dte > 10.0:
@@ -383,11 +370,7 @@ def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
         return round(dte, 2)
 
     try:
-        bs = stock.quarterly_balance_sheet
-        if bs.empty:
-            bs = stock.balance_sheet
-
-        if not bs.empty:
+        if isinstance(bs, pd.DataFrame) and not bs.empty:
             total_debt = None
             for key in ["Total Debt", "Short Long Term Debt", "Long Term Debt"]:
                 if key in bs.index:
@@ -412,7 +395,7 @@ def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
     return None
 
 
-# --- VALUATION ENGINE WITH FULL DUAL-LISTING FALLBACKS ---
+# --- VALUATION ENGINE WITH FALLBACKS ---
 def calculate_buffett_value(
     ticker_symbol: str,
     growth_rate: float,
@@ -421,16 +404,39 @@ def calculate_buffett_value(
     margin_of_safety: float,
     years: int = 10,
 ):
-    """Calculates intrinsic value based on Owner Earnings & DCF with deep fallbacks for dual-listed UK stocks like RIO.L."""
+    """Calculates intrinsic value based on Owner Earnings & DCF with fallbacks for UK stocks and rate limits."""
     ticker_symbol = ticker_symbol.strip().upper()
-    stock, info = fetch_ticker_with_retry(ticker_symbol)
+    info, cashflow, financials, bs, divs, hist_df = fetch_ticker_snapshot(
+        ticker_symbol
+    )
 
-    if not stock or not info:
+    is_uk_stock = ticker_symbol.endswith(".L")
+    currency_symbol = "£" if is_uk_stock else "$"
+    financial_currency = str(info.get("financialCurrency", ""))
+    sector = info.get("sector", "N/A")
+
+    raw_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if raw_price is None and not hist_df.empty and "Close" in hist_df.columns:
+        valid_closes = hist_df["Close"].dropna()
+        if not valid_closes.empty:
+            raw_price = float(valid_closes.iloc[-1])
+
+    current_price = (raw_price / 100.0) if (raw_price and is_uk_stock) else raw_price
+
+    annual_price_chg = None
+    if not hist_df.empty and "Close" in hist_df.columns:
+        valid_closes = hist_df["Close"].dropna()
+        if len(valid_closes) >= 2 and float(valid_closes.iloc[0]) > 0:
+            start_p = float(valid_closes.iloc[0])
+            end_p = float(valid_closes.iloc[-1])
+            annual_price_chg = round(((end_p - start_p) / start_p) * 100.0, 2)
+
+    if current_price is None and not info:
         return {
             "Ticker": ticker_symbol,
             "Company": ticker_symbol,
             "Sector": "N/A",
-            "Currency": "£" if ticker_symbol.endswith(".L") else "$",
+            "Currency": currency_symbol,
             "Price": None,
             "P/E Ratio": None,
             "ROE (%)": None,
@@ -441,24 +447,14 @@ def calculate_buffett_value(
             "Buy Price": None,
             "Upside (%)": None,
             "Div Yield (%)": None,
-            "Annual Price Chg (%)": None,
+            "Annual Price Chg (%)": annual_price_chg,
             "Current Revenue Pred (%)": None,
             "Ex-Div Date": "N/A",
             "Status": "ERROR (Rate-Limited/Unavailable)",
         }
 
-    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    is_uk_stock = ticker_symbol.endswith(".L")
-    currency_symbol = "£" if is_uk_stock else "$"
-    financial_currency = info.get("financialCurrency", "")
-    sector = info.get("sector", "N/A")
-
-    if current_price and is_uk_stock:
-        current_price = current_price / 100.0
-
-    ex_div_date_str = get_ex_dividend_info(stock)
-    div_yield_pct = get_dividend_yield(info)
-    annual_price_chg = get_annual_price_change(stock)
+    ex_div_date_str = get_ex_dividend_info_from_data(info, divs)
+    div_yield_pct = get_dividend_yield(info, fallback_price=raw_price)
 
     current_rev_pred = None
     if annual_price_chg is not None and div_yield_pct is not None:
@@ -466,9 +462,8 @@ def calculate_buffett_value(
 
     pe_ratio = get_pe_ratio(info)
     roe = get_return_on_equity(info)
-
-    debt_ratio = get_debt_ratio(info, stock)
-    debt_to_equity = get_debt_to_equity(info, stock)
+    debt_ratio = get_debt_ratio(bs)
+    debt_to_equity = get_debt_to_equity(info, bs)
 
     shares_outstanding = info.get("sharesOutstanding")
     market_cap = info.get("marketCap")
@@ -495,14 +490,13 @@ def calculate_buffett_value(
             "Annual Price Chg (%)": annual_price_chg,
             "Current Revenue Pred (%)": current_rev_pred,
             "Ex-Div Date": ex_div_date_str,
-            "Status": "ERROR (Missing Price/Shares)",
+            "Status": "PARTIAL (QuoteSummary Limited)" if current_price else "ERROR (Missing Price/Shares)",
         }
 
     operating_cf = None
     capex = 0.0
 
-    cashflow = stock.cashflow
-    if not cashflow.empty:
+    if isinstance(cashflow, pd.DataFrame) and not cashflow.empty:
         latest_cf = cashflow.iloc[:, 0]
         operating_cf = latest_cf.get("Operating Cash Flow") or latest_cf.get(
             "Free Cash Flow"
@@ -510,27 +504,25 @@ def calculate_buffett_value(
         raw_capex = latest_cf.get("Capital Expenditure") or latest_cf.get(
             "Capital Expenditures"
         )
-        if raw_capex is not None:
-            capex = abs(raw_capex)
+        if raw_capex is not None and pd.notna(raw_capex):
+            capex = abs(float(raw_capex))
 
     if operating_cf is None:
         operating_cf = info.get("freeCashflow") or info.get("operatingCashflow")
 
-    if operating_cf is None:
+    if operating_cf is None and isinstance(financials, pd.DataFrame) and not financials.empty:
         try:
-            financials = stock.financials
-            if not financials.empty:
-                latest_fin = financials.iloc[:, 0]
-                for net_inc_key in [
-                    "Net Income",
-                    "Net Income Common Stockholders",
-                    "Net Income From Continuing Operation",
-                    "Net Income Including Noncontrolling Interests",
-                    "Normalized Income",
-                ]:
-                    if net_inc_key in latest_fin.index:
-                        operating_cf = latest_fin.get(net_inc_key)
-                        break
+            latest_fin = financials.iloc[:, 0]
+            for net_inc_key in [
+                "Net Income",
+                "Net Income Common Stockholders",
+                "Net Income From Continuing Operation",
+                "Net Income Including Noncontrolling Interests",
+                "Normalized Income",
+            ]:
+                if net_inc_key in latest_fin.index:
+                    operating_cf = latest_fin.get(net_inc_key)
+                    break
         except Exception:
             pass
 
@@ -560,12 +552,11 @@ def calculate_buffett_value(
             "Status": "N/A (Data Unavailable)",
         }
 
-    owner_earnings = operating_cf - capex
-    owner_earnings_per_share = owner_earnings / shares_outstanding
+    owner_earnings = float(operating_cf) - capex
+    owner_earnings_per_share = owner_earnings / float(shares_outstanding)
 
-    if is_uk_stock and financial_currency.upper() in ["GBX", "GBP"]:
-        if financial_currency.upper() == "GBX":
-            owner_earnings_per_share = owner_earnings_per_share / 100.0
+    if is_uk_stock and financial_currency.upper() == "GBX":
+        owner_earnings_per_share = owner_earnings_per_share / 100.0
 
     pv_future_cash_flows = 0.0
     projected_oe = owner_earnings_per_share

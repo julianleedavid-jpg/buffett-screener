@@ -225,21 +225,33 @@ def get_ex_dividend_info(stock: yf.Ticker) -> str:
   return "N/A"
 
 
-def get_dividend_yield(info: dict) -> float:
-  """Extracts annual dividend yield as a percentage, reliably handling UK pence (GBX/GBp) vs pounds."""
+def get_dividend_yield(
+    info: dict,
+    stock: yf.Ticker | None = None,
+    current_price: float | None = None,
+    is_uk_stock: bool = False,
+) -> float:
+  """Extracts annual dividend yield (%), falling back to trailing 12M dividends if info omits it."""
   raw_yield = info.get("dividendYield")
-  if raw_yield is not None:
-    if 0 < raw_yield < 0.30:
-      return round(raw_yield * 100, 2)
-    elif 0.30 <= raw_yield <= 50.0:
-      return round(raw_yield, 2)
+  if raw_yield is not None and pd.notna(raw_yield):
+    val = float(raw_yield)
+    if 0 < val < 0.30:
+      return round(val * 100, 2)
+    elif 0.30 <= val <= 50.0:
+      return round(val, 2)
 
   div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
-  price = info.get("currentPrice") or info.get("regularMarketPrice")
+  price = (
+      current_price
+      if current_price and current_price > 0
+      else (info.get("currentPrice") or info.get("regularMarketPrice"))
+  )
   fin_currency = str(info.get("financialCurrency", "")).upper()
-  symbol_is_uk = str(info.get("symbol", "")).endswith(".L")
+  symbol_is_uk = is_uk_stock or str(info.get("symbol", "")).endswith(".L")
 
   if div_rate and price and price > 0:
+    div_rate = float(div_rate)
+    price = float(price)
     if symbol_is_uk or fin_currency in ["GBX", "GBP"]:
       calculated_yield = (div_rate / price) * 100
       if 0.1 <= calculated_yield <= 50.0:
@@ -252,6 +264,29 @@ def get_dividend_yield(info: dict) -> float:
       calculated_yield = (div_rate / price) * 100
       if 0.1 <= calculated_yield <= 50.0:
         return round(calculated_yield, 2)
+
+  # Fallback: Sum trailing 12-month dividends from stock.dividends
+  if stock is not None and price and float(price) > 0:
+    try:
+      divs = stock.dividends
+      if divs is not None and not divs.empty:
+        cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
+        ttm_div = float(divs[divs.index >= cutoff].sum())
+        if ttm_div > 0:
+          p = float(price)
+          if symbol_is_uk or fin_currency == "GBX":
+            y_direct = (ttm_div / p) * 100.0
+            if 0.1 <= y_direct <= 50.0:
+              return round(y_direct, 2)
+            y_pence = ((ttm_div * 100.0) / p) * 100.0
+            if 0.1 <= y_pence <= 50.0:
+              return round(y_pence, 2)
+          else:
+            y_us = (ttm_div / p) * 100.0
+            if 0.1 <= y_us <= 50.0:
+              return round(y_us, 2)
+    except Exception:
+      pass
 
   return 0.00
 
@@ -488,7 +523,12 @@ def calculate_buffett_value(
     current_price = get_fallback_price(ticker_symbol)
 
   ex_div_date_str = get_ex_dividend_info(stock)
-  div_yield_pct = get_dividend_yield(info)
+  div_yield_pct = get_dividend_yield(
+      info,
+      stock=stock,
+      current_price=current_price,
+      is_uk_stock=is_uk_stock,
+  )
   annual_price_chg = get_annual_price_change(stock)
 
   # Calculate current revenue prediction (%): Annual Price Change + Dividend Yield

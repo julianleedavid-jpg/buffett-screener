@@ -149,7 +149,7 @@ def fetch_ticker_with_retry(
 
 
 def get_fallback_price(ticker_symbol: str) -> float | None:
-    """Fetches the latest close price via yf.download() when quoteSummary/.info is unavailable."""
+    """Fetches the latest close price via yf.download() when quoteSummary/.info price is unavailable."""
     symbol = ticker_symbol.strip().upper()
     is_uk = symbol.endswith(".L")
     try:
@@ -417,6 +417,8 @@ def calculate_buffett_value(
 
     if current_price and is_uk_stock:
         current_price = current_price / 100.0
+    elif current_price is None:
+        current_price = get_fallback_price(ticker_symbol)
 
     ex_div_date_str = get_ex_dividend_info(stock)
     div_yield_pct = get_dividend_yield(info)

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 import json
 import os
@@ -148,6 +148,24 @@ def fetch_ticker_with_retry(
     return None, {}
 
 
+def get_fallback_price(ticker_symbol: str) -> float | None:
+    """Fetches the latest close price via yf.download() when quoteSummary/.info is unavailable."""
+    symbol = ticker_symbol.strip().upper()
+    is_uk = symbol.endswith(".L")
+    try:
+        hist = yf.download(symbol, period="5d", progress=False)
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0].dropna()
+            if not closes.empty:
+                price = float(closes.iloc[-1])
+                return (price / 100.0) if is_uk else price
+    except Exception:
+        pass
+    return None
+
+
 def get_ex_dividend_info(stock: yf.Ticker) -> str:
     """Returns upcoming ex-dividend date if future, checking calendar, info, events, or fallback."""
     today = datetime.now().date()
@@ -284,6 +302,7 @@ def get_return_on_equity(info: dict) -> float | None:
         return round(roe, 2)
     return None
 
+
 def get_debt_ratio(info: dict, stock: yf.Ticker) -> float | None:
     """Extracts Total Debt to Total Assets ratio from balance sheet if available."""
     try:
@@ -310,6 +329,8 @@ def get_debt_ratio(info: dict, stock: yf.Ticker) -> float | None:
         pass
 
     return None
+
+
 def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
     """Extracts Debt to Equity ratio, checking quarterly balance sheet as fallback."""
     dte = info.get("debtToEquity")
@@ -362,12 +383,13 @@ def calculate_buffett_value(
     stock, info = fetch_ticker_with_retry(ticker_symbol)
 
     if not stock or not info:
+        fallback_price = get_fallback_price(ticker_symbol)
         return {
             "Ticker": ticker_symbol,
             "Company": ticker_symbol,
             "Sector": "N/A",
             "Currency": "£" if ticker_symbol.endswith(".L") else "$",
-            "Price": None,
+            "Price": fallback_price,
             "P/E Ratio": None,
             "ROE (%)": None,
             "Owner Earn/Sh": None,
@@ -380,7 +402,11 @@ def calculate_buffett_value(
             "Annual Price Chg (%)": None,
             "Current Revenue Pred (%)": None,
             "Ex-Div Date": "N/A",
-            "Status": "ERROR (Rate-Limited/Unavailable)",
+            "Status": (
+                "PRICE ONLY (QuoteSummary Limited)"
+                if fallback_price is not None
+                else "ERROR (Rate-Limited/Unavailable)"
+            ),
         }
 
     current_price = info.get("currentPrice") or info.get("regularMarketPrice")

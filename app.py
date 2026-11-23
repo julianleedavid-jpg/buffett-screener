@@ -442,6 +442,18 @@ def calculate_buffett_value(
     if not shares_outstanding and market_cap and current_price and current_price > 0:
         shares_outstanding = market_cap / current_price
 
+    if not shares_outstanding:
+        try:
+            fi = stock.fast_info
+            fast_shares = getattr(fi, "shares", None)
+            fast_mcap = getattr(fi, "market_cap", None)
+            if fast_shares and fast_shares > 0:
+                shares_outstanding = float(fast_shares)
+            elif fast_mcap and current_price and current_price > 0:
+                shares_outstanding = float(fast_mcap) / float(current_price)
+        except Exception:
+            pass
+
     if not current_price or not shares_outstanding:
         return {
             "Ticker": ticker_symbol,

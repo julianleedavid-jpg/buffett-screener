@@ -5,7 +5,6 @@ import os
 import time
 
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
@@ -25,20 +24,6 @@ DEFAULT_WATCHLISTS = {
     ],
 }
 
-TIMELINE_PRESETS = {
-    "1 Day": {"period": "1d", "interval": "5m"},
-    "1 Week": {"period": "5d", "interval": "15m"},
-    "1 Month": {"period": "1mo", "interval": "1d"},
-    "3 Months": {"period": "3mo", "interval": "1d"},
-    "6 Months": {"period": "6mo", "interval": "1d"},
-    "1 Year": {"period": "1y", "interval": "1d"},
-    "2 Years": {"period": "2y", "interval": "1d"},
-    "3 Years": {"period": "3y", "interval": "1d"},
-    "5 Years": {"period": "5y", "interval": "1wk"},
-    "All Time": {"period": "max", "interval": "1mo"},
-    "Custom": None,
-}
-
 
 # --- DYNAMIC FTSE 100 FETCHING ---
 @st.cache_data(ttl=86400)
@@ -55,7 +40,10 @@ def get_live_ftse100_tickers() -> list:
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        tables = pd.read_html(io.StringIO(response.text))
+
+        html_buffer = io.StringIO(response.text)
+        tables = pd.read_html(html_buffer)
+
         for table in tables:
             if "Ticker" in table.columns:
                 tickers = (
@@ -98,7 +86,10 @@ def get_live_sp500_tickers() -> list:
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        tables = pd.read_html(io.StringIO(response.text))
+
+        html_buffer = io.StringIO(response.text)
+        tables = pd.read_html(html_buffer)
+
         for table in tables:
             if "Symbol" in table.columns:
                 tickers = (
@@ -137,157 +128,88 @@ def save_watchlists(watchlists: dict):
         json.dump(sorted_watchlists, f, indent=4)
 
 
-# --- MULTI-SHARE TIMELINE DATA FETCHING ---
-@st.cache_data(ttl=300)
-def fetch_timeline_prices(
-    ticker_list: list[str], tf: str, start_dt=None, end_dt=None
-) -> pd.DataFrame:
-    """Fetches historical close prices for multiple tickers on a unified timeline."""
-    if not ticker_list:
-        return pd.DataFrame()
-
-    if tf == "Custom":
-        if not start_dt or not end_dt or start_dt >= end_dt:
-            return pd.DataFrame()
-        data = yf.download(
-            ticker_list,
-            start=start_dt,
-            end=end_dt + timedelta(days=1),
-            progress=False,
-            auto_adjust=True,
-        )
-    elif tf == "3 Years":
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=365 * 3)
-        data = yf.download(
-            ticker_list,
-            start=start_date,
-            end=end_date + timedelta(days=1),
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-        )
-    else:
-        cfg = TIMELINE_PRESETS[tf]
-        data = yf.download(
-            ticker_list,
-            period=cfg["period"],
-            interval=cfg["interval"],
-            progress=False,
-            auto_adjust=True,
-        )
-
-    if data is None or data.empty:
-        return pd.DataFrame()
-
-    if isinstance(data.columns, pd.MultiIndex):
-        closes = data["Close"].copy()
-    else:
-        closes = data[["Close"]].rename(columns={"Close": ticker_list[0]}).copy()
-
-    # Convert UK pence (.L) prices from GBX to GBP for consistent comparison
-    for col in closes.columns:
-        if str(col).upper().endswith(".L"):
-            closes[col] = closes[col] / 100.0
-
-    return closes.dropna(how="all")
+# --- RATE-LIMIT RESILIENT DATA FETCHING ---
+def fetch_ticker_with_retry(
+    ticker_symbol: str, retries: int = 3, delay: float = 1.5
+):
+    """Fetches a yfinance Ticker object with retries and exponential backoff if rate-limited."""
+    for attempt in range(retries):
+        try:
+            stock = yf.Ticker(ticker_symbol)
+            info = stock.info
+            if info:
+                return stock, info
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "ratelimit" in err_msg or "429" in err_msg or "too many" in err_msg:
+                time.sleep(delay * (attempt + 1))
+            else:
+                break
+    return None, {}
 
 
-# --- RESILIENT SNAPSHOT DATA FETCHING ---
-@st.cache_data(ttl=900)
-def fetch_ticker_snapshot(ticker_symbol: str):
-    """Fetches info, statements, and chart history with fallback when quoteSummary is rate-limited."""
-    ticker_symbol = ticker_symbol.strip().upper()
-    info = {}
-    cashflow_df = pd.DataFrame()
-    financials_df = pd.DataFrame()
-    bs_df = pd.DataFrame()
-    divs_series = pd.Series(dtype=float)
-    hist_df = pd.DataFrame()
+def get_ex_dividend_info(stock: yf.Ticker) -> str:
+    """Returns upcoming ex-dividend date if future, checking calendar, info, events, or fallback."""
+    today = datetime.now().date()
+    candidate_date = None
 
-    # 1. Always fetch 1Y chart data via yf.download (reliable even when .info is 429'd)
     try:
-        dl = yf.download(
-            ticker_symbol,
-            period="1y",
-            interval="1d",
-            progress=False,
-            auto_adjust=False,
-        )
-        if dl is not None and not dl.empty:
-            if isinstance(dl.columns, pd.MultiIndex):
-                dl.columns = dl.columns.get_level_values(0)
-            hist_df = dl
+        cal = stock.calendar
+        if isinstance(cal, dict) and "Ex-Dividend Date" in cal:
+            ex_date = cal["Ex-Dividend Date"]
+            if ex_date:
+                if isinstance(ex_date, (datetime, pd.Timestamp)):
+                    candidate_date = ex_date.date()
+                elif isinstance(ex_date, str):
+                    candidate_date = pd.to_datetime(ex_date).date()
     except Exception:
         pass
 
-    # 2. Try quoteSummary (.info & statements) with backoff
-    for attempt in range(3):
+    if not candidate_date:
         try:
-            stock = yf.Ticker(ticker_symbol)
-            raw_info = stock.info
-            if isinstance(raw_info, dict) and len(raw_info) > 1:
-                info = raw_info
-                try:
-                    cashflow_df = stock.cashflow
-                except Exception:
-                    pass
-                try:
-                    financials_df = stock.financials
-                except Exception:
-                    pass
-                try:
-                    q_bs = stock.quarterly_balance_sheet
-                    bs_df = (
-                        q_bs
-                        if isinstance(q_bs, pd.DataFrame) and not q_bs.empty
-                        else stock.balance_sheet
-                    )
-                except Exception:
-                    pass
-                try:
-                    divs_series = stock.dividends
-                except Exception:
-                    pass
-                break
-        except Exception as e:
-            err_msg = str(e).lower()
-            if (
-                "ratelimit" in err_msg
-                or "429" in err_msg
-                or "too many" in err_msg
-            ):
-                time.sleep(2.0 * (attempt + 1))
-            else:
-                break
-
-    return info, cashflow_df, financials_df, bs_df, divs_series, hist_df
-
-
-def get_ex_dividend_info_from_data(info: dict, divs: pd.Series) -> str:
-    """Returns upcoming or last known ex-dividend date from cached snapshot data."""
-    today = datetime.now().date()
-    ex_ts = info.get("exDividendDate")
-    if ex_ts:
-        try:
-            candidate_date = pd.to_datetime(ex_ts, unit="s").date()
-            if candidate_date >= today:
-                return candidate_date.strftime("%Y-%m-%d")
-            return f"{candidate_date.strftime('%Y-%m-%d')} (Last Known)"
+            ex_ts = stock.info.get("exDividendDate")
+            if ex_ts:
+                candidate_date = pd.to_datetime(ex_ts, unit="s").date()
         except Exception:
             pass
 
-    if isinstance(divs, pd.Series) and not divs.empty:
+    if not candidate_date:
         try:
+            events = stock.events
+            if isinstance(events, pd.DataFrame) and not events.empty:
+                col = next(
+                    (
+                        c
+                        for c in ["Ex-Dividend Date", "Dividend Date"]
+                        if c in events.columns
+                    ),
+                    None,
+                )
+                if col:
+                    future_events = events[events.index.date >= today]
+                    if not future_events.empty:
+                        candidate_date = future_events.index[0].date()
+        except Exception:
+            pass
+
+    if candidate_date:
+        if candidate_date >= today:
+            return candidate_date.strftime("%Y-%m-%d")
+        else:
+            return f"{candidate_date.strftime('%Y-%m-%d')} (Last Known)"
+
+    try:
+        divs = stock.dividends
+        if not divs.empty:
             last_date = divs.index[-1].date()
             return f"{last_date.strftime('%Y-%m-%d')} (Last Known)"
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     return "N/A"
 
 
-def get_dividend_yield(info: dict, fallback_price: float | None = None) -> float:
+def get_dividend_yield(info: dict) -> float:
     """Extracts annual dividend yield as a percentage, reliably handling UK pence (GBX/GBp) vs pounds."""
     raw_yield = info.get("dividendYield")
     if raw_yield is not None:
@@ -297,11 +219,7 @@ def get_dividend_yield(info: dict, fallback_price: float | None = None) -> float
             return round(raw_yield, 2)
 
     div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
-    price = (
-        info.get("currentPrice")
-        or info.get("regularMarketPrice")
-        or fallback_price
-    )
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
     fin_currency = str(info.get("financialCurrency", "")).upper()
     symbol_is_uk = str(info.get("symbol", "")).endswith(".L")
 
@@ -322,6 +240,33 @@ def get_dividend_yield(info: dict, fallback_price: float | None = None) -> float
     return 0.00
 
 
+def get_annual_price_change(
+    stock: yf.Ticker, retries: int = 3, delay: float = 1.5
+) -> float | None:
+    """Calculates the 1-year trailing percentage change in share price with retry and backoff logic."""
+    for attempt in range(retries):
+        try:
+            hist = stock.history(period="1y")
+            if hist is not None and len(hist) >= 2:
+                start_price = hist["Close"].iloc[0]
+                end_price = hist["Close"].iloc[-1]
+                if start_price and start_price > 0:
+                    pct_change = ((end_price - start_price) / start_price) * 100
+                    return round(pct_change, 2)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if (
+                "ratelimit" in err_msg
+                or "429" in err_msg
+                or "too many" in err_msg
+                or "empty" in err_msg
+            ):
+                time.sleep(delay * (attempt + 1))
+            else:
+                time.sleep(delay)
+    return None
+
+
 def get_pe_ratio(info: dict) -> float | None:
     """Extracts trailing or forward P/E ratio rounded to 2 decimal places."""
     pe = info.get("trailingPE") or info.get("forwardPE")
@@ -340,29 +285,8 @@ def get_return_on_equity(info: dict) -> float | None:
     return None
 
 
-def get_debt_ratio(bs: pd.DataFrame) -> float | None:
-    """Extracts Total Debt to Total Assets ratio from balance sheet if available."""
-    try:
-        if isinstance(bs, pd.DataFrame) and not bs.empty:
-            total_debt = None
-            for key in ["Total Debt", "Short Long Term Debt", "Long Term Debt"]:
-                if key in bs.index:
-                    total_debt = bs.loc[key].iloc[0]
-                    break
-            total_assets = None
-            for key in ["Total Assets"]:
-                if key in bs.index:
-                    total_assets = bs.loc[key].iloc[0]
-                    break
-            if total_debt is not None and total_assets and total_assets > 0:
-                return round(float(total_debt) / float(total_assets), 2)
-    except Exception:
-        pass
-    return None
-
-
-def get_debt_to_equity(info: dict, bs: pd.DataFrame) -> float | None:
-    """Extracts Debt to Equity ratio, checking balance sheet as fallback."""
+def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
+    """Extracts Debt to Equity ratio, checking quarterly balance sheet as fallback."""
     dte = info.get("debtToEquity")
     if dte is not None:
         if dte > 10.0:
@@ -370,7 +294,11 @@ def get_debt_to_equity(info: dict, bs: pd.DataFrame) -> float | None:
         return round(dte, 2)
 
     try:
-        if isinstance(bs, pd.DataFrame) and not bs.empty:
+        bs = stock.quarterly_balance_sheet
+        if bs.empty:
+            bs = stock.balance_sheet
+
+        if not bs.empty:
             total_debt = None
             for key in ["Total Debt", "Short Long Term Debt", "Long Term Debt"]:
                 if key in bs.index:
@@ -395,7 +323,7 @@ def get_debt_to_equity(info: dict, bs: pd.DataFrame) -> float | None:
     return None
 
 
-# --- VALUATION ENGINE WITH FALLBACKS ---
+# --- VALUATION ENGINE WITH FULL DUAL-LISTING FALLBACKS ---
 def calculate_buffett_value(
     ticker_symbol: str,
     growth_rate: float,
@@ -404,39 +332,16 @@ def calculate_buffett_value(
     margin_of_safety: float,
     years: int = 10,
 ):
-    """Calculates intrinsic value based on Owner Earnings & DCF with fallbacks for UK stocks and rate limits."""
+    """Calculates intrinsic value based on Owner Earnings & DCF with deep fallbacks for dual-listed UK stocks like RIO.L."""
     ticker_symbol = ticker_symbol.strip().upper()
-    info, cashflow, financials, bs, divs, hist_df = fetch_ticker_snapshot(
-        ticker_symbol
-    )
+    stock, info = fetch_ticker_with_retry(ticker_symbol)
 
-    is_uk_stock = ticker_symbol.endswith(".L")
-    currency_symbol = "£" if is_uk_stock else "$"
-    financial_currency = str(info.get("financialCurrency", ""))
-    sector = info.get("sector", "N/A")
-
-    raw_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    if raw_price is None and not hist_df.empty and "Close" in hist_df.columns:
-        valid_closes = hist_df["Close"].dropna()
-        if not valid_closes.empty:
-            raw_price = float(valid_closes.iloc[-1])
-
-    current_price = (raw_price / 100.0) if (raw_price and is_uk_stock) else raw_price
-
-    annual_price_chg = None
-    if not hist_df.empty and "Close" in hist_df.columns:
-        valid_closes = hist_df["Close"].dropna()
-        if len(valid_closes) >= 2 and float(valid_closes.iloc[0]) > 0:
-            start_p = float(valid_closes.iloc[0])
-            end_p = float(valid_closes.iloc[-1])
-            annual_price_chg = round(((end_p - start_p) / start_p) * 100.0, 2)
-
-    if current_price is None and not info:
+    if not stock or not info:
         return {
             "Ticker": ticker_symbol,
             "Company": ticker_symbol,
             "Sector": "N/A",
-            "Currency": currency_symbol,
+            "Currency": "£" if ticker_symbol.endswith(".L") else "$",
             "Price": None,
             "P/E Ratio": None,
             "ROE (%)": None,
@@ -447,24 +352,37 @@ def calculate_buffett_value(
             "Buy Price": None,
             "Upside (%)": None,
             "Div Yield (%)": None,
-            "Annual Price Chg (%)": annual_price_chg,
+            "Annual Price Chg (%)": None,
             "Current Revenue Pred (%)": None,
             "Ex-Div Date": "N/A",
             "Status": "ERROR (Rate-Limited/Unavailable)",
         }
 
-    ex_div_date_str = get_ex_dividend_info_from_data(info, divs)
-    div_yield_pct = get_dividend_yield(info, fallback_price=raw_price)
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    is_uk_stock = ticker_symbol.endswith(".L")
+    currency_symbol = "£" if is_uk_stock else "$"
+    financial_currency = info.get("financialCurrency", "")
+    sector = info.get("sector", "N/A")
 
+    if current_price and is_uk_stock:
+        current_price = current_price / 100.0
+
+    ex_div_date_str = get_ex_dividend_info(stock)
+    div_yield_pct = get_dividend_yield(info)
+    annual_price_chg = get_annual_price_change(stock)
+
+    # Calculate current revenue prediction (%): Annual Price Change + Dividend Yield
     current_rev_pred = None
     if annual_price_chg is not None and div_yield_pct is not None:
         current_rev_pred = round(annual_price_chg + div_yield_pct, 2)
 
     pe_ratio = get_pe_ratio(info)
     roe = get_return_on_equity(info)
-    debt_ratio = get_debt_ratio(bs)
-    debt_to_equity = get_debt_to_equity(info, bs)
 
+    debt_ratio = get_debt_ratio(info, stock)
+    debt_to_equity = get_debt_to_equity(info, stock)
+
+    # --- SHARES OUTSTANDING FALLBACK ---
     shares_outstanding = info.get("sharesOutstanding")
     market_cap = info.get("marketCap")
 
@@ -490,13 +408,15 @@ def calculate_buffett_value(
             "Annual Price Chg (%)": annual_price_chg,
             "Current Revenue Pred (%)": current_rev_pred,
             "Ex-Div Date": ex_div_date_str,
-            "Status": "PARTIAL (QuoteSummary Limited)" if current_price else "ERROR (Missing Price/Shares)",
+            "Status": "ERROR (Missing Price/Shares)",
         }
 
+    # --- CASH FLOW & OWNER EARNINGS EXTRACTION ---
     operating_cf = None
     capex = 0.0
 
-    if isinstance(cashflow, pd.DataFrame) and not cashflow.empty:
+    cashflow = stock.cashflow
+    if not cashflow.empty:
         latest_cf = cashflow.iloc[:, 0]
         operating_cf = latest_cf.get("Operating Cash Flow") or latest_cf.get(
             "Free Cash Flow"
@@ -504,25 +424,27 @@ def calculate_buffett_value(
         raw_capex = latest_cf.get("Capital Expenditure") or latest_cf.get(
             "Capital Expenditures"
         )
-        if raw_capex is not None and pd.notna(raw_capex):
-            capex = abs(float(raw_capex))
+        if raw_capex is not None:
+            capex = abs(raw_capex)
 
     if operating_cf is None:
         operating_cf = info.get("freeCashflow") or info.get("operatingCashflow")
 
-    if operating_cf is None and isinstance(financials, pd.DataFrame) and not financials.empty:
+    if operating_cf is None:
         try:
-            latest_fin = financials.iloc[:, 0]
-            for net_inc_key in [
-                "Net Income",
-                "Net Income Common Stockholders",
-                "Net Income From Continuing Operation",
-                "Net Income Including Noncontrolling Interests",
-                "Normalized Income",
-            ]:
-                if net_inc_key in latest_fin.index:
-                    operating_cf = latest_fin.get(net_inc_key)
-                    break
+            financials = stock.financials
+            if not financials.empty:
+                latest_fin = financials.iloc[:, 0]
+                for net_inc_key in [
+                    "Net Income",
+                    "Net Income Common Stockholders",
+                    "Net Income From Continuing Operation",
+                    "Net Income Including Noncontrolling Interests",
+                    "Normalized Income",
+                ]:
+                    if net_inc_key in latest_fin.index:
+                        operating_cf = latest_fin.get(net_inc_key)
+                        break
         except Exception:
             pass
 
@@ -552,11 +474,12 @@ def calculate_buffett_value(
             "Status": "N/A (Data Unavailable)",
         }
 
-    owner_earnings = float(operating_cf) - capex
-    owner_earnings_per_share = owner_earnings / float(shares_outstanding)
+    owner_earnings = operating_cf - capex
+    owner_earnings_per_share = owner_earnings / shares_outstanding
 
-    if is_uk_stock and financial_currency.upper() == "GBX":
-        owner_earnings_per_share = owner_earnings_per_share / 100.0
+    if is_uk_stock and financial_currency.upper() in ["GBX", "GBP"]:
+        if financial_currency.upper() == "GBX":
+            owner_earnings_per_share = owner_earnings_per_share / 100.0
 
     pv_future_cash_flows = 0.0
     projected_oe = owner_earnings_per_share
@@ -645,6 +568,7 @@ def render_valuation_table(df):
     )
     st.dataframe(styled_df, use_container_width=True, height=750)
 
+    # --- Display Summary Metrics at the end of the table (Excluding missing/N/A entries) ---
     col_m1, col_m2 = st.columns(2)
 
     if "Div Yield (%)" in df.columns:
@@ -657,9 +581,10 @@ def render_valuation_table(df):
             valid_yield_df["Div Yield (%)"], errors="coerce"
         ).dropna()
         if not valid_yields.empty:
+            avg_div_yield = valid_yields.mean()
             col_m1.metric(
                 label="Average Dividend Yield (Scanned Universe)",
-                value=f"{valid_yields.mean():.2f}%",
+                value=f"{avg_div_yield:.2f}%",
             )
         else:
             col_m1.metric(
@@ -676,9 +601,10 @@ def render_valuation_table(df):
             valid_rev_df["Current Revenue Pred (%)"], errors="coerce"
         ).dropna()
         if not valid_rev_preds.empty:
+            total_rev_pred = valid_rev_preds.mean()
             col_m2.metric(
                 label="Average Current Revenue Prediction (Scanned Universe)",
-                value=f"{valid_rev_preds.mean():.2f}%",
+                value=f"{total_rev_pred:.2f}%",
             )
         else:
             col_m2.metric(
@@ -689,14 +615,14 @@ def render_valuation_table(df):
 
 # --- STREAMLIT UI SETUP ---
 st.set_page_config(
-    page_title="Share App — Timeline & Buffett Screener",
-    page_icon="📈",
-    layout="wide",
+    page_title="Buffett Value Calculator", page_icon="📈", layout="wide"
 )
 
+# --- INJECT CUSTOM CSS FOR FLOATING / STICKY TABLE HEADERS ---
 st.markdown(
     """
     <style>
+    /* Pin and float DataFrame headers */
     div[data-testid="stDataFrame"] div[role="columnheader"],
     div[data-testid="stDataFrame"] [data-testid="stTable"] th {
         position: sticky !important;
@@ -724,7 +650,7 @@ if "ftse_results_df" not in st.session_state:
 if "sp500_results_df" not in st.session_state:
     st.session_state.sp500_results_df = None
 
-st.title("📈 Share App — Watchlist Timeline & Buffett Screener")
+st.title("📈 Buffett Value Investing & Portfolio Screener")
 
 # --- SIDEBAR PARAMETERS ---
 st.sidebar.header("Valuation Parameters")
@@ -748,166 +674,14 @@ margin_of_safety = (
     st.sidebar.slider("Margin of Safety (%)", 0, 50, 25, step=5) / 100.0
 )
 
-tab_timeline, tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
-        "📊 Watchlist Price Timeline",
         "🔍 Single Stock Analysis",
         "📋 Personal Watchlist Screener",
         "🇬🇧 Live FTSE 100 Screener",
         "🇺🇸 Live S&P 500 Screener",
     ]
 )
-
-# ==========================================
-# TAB 0: WATCHLIST SHARE PRICE TIMELINE
-# ==========================================
-with tab_timeline:
-    st.subheader("Watchlist Share Price Timeline")
-
-    all_wl_names_tl = list(st.session_state.watchlists.keys())
-    col_w1, col_w2, col_w3 = st.columns([1.2, 2.2, 1.3])
-
-    with col_w1:
-        chart_wl_name = st.selectbox(
-            "Watchlist",
-            options=all_wl_names_tl,
-            index=all_wl_names_tl.index(st.session_state.active_watchlist_name)
-            if st.session_state.active_watchlist_name in all_wl_names_tl
-            else 0,
-            key="timeline_watchlist_selector",
-        )
-        st.session_state.active_watchlist_name = chart_wl_name
-
-    wl_tickers_available = st.session_state.watchlists.get(chart_wl_name, [])
-
-    with col_w2:
-        selected_tl_tickers = st.multiselect(
-            f"Shares from '{chart_wl_name}'",
-            options=wl_tickers_available,
-            default=wl_tickers_available,
-        )
-
-    with col_w3:
-        extra_tl_raw = st.text_input(
-            "Compare Extra Tickers (optional)",
-            value="",
-            placeholder="e.g., NVDA, AZN.L",
-        )
-
-    extra_tl = [
-        t.strip().upper() for t in extra_tl_raw.split(",") if t.strip()
-    ]
-    tl_tickers = list(dict.fromkeys(selected_tl_tickers + extra_tl))
-
-    col_p1, col_p2 = st.columns([3, 1])
-    with col_p1:
-        selected_tf = st.radio(
-            "Timeline",
-            options=list(TIMELINE_PRESETS.keys()),
-            index=5,  # Default: 1 Year
-            horizontal=True,
-        )
-    with col_p2:
-        tl_mode = st.selectbox(
-            "Y-Axis Scale",
-            options=["Normalized (% Change)", "Actual Price"],
-        )
-
-    tl_start, tl_end = None, None
-    if selected_tf == "Custom":
-        today = datetime.today().date()
-        c_s, c_e = st.columns(2)
-        with c_s:
-            tl_start = st.date_input(
-                "Custom Start Date", value=today - timedelta(days=180)
-            )
-        with c_e:
-            tl_end = st.date_input("Custom End Date", value=today)
-
-    if not tl_tickers:
-        st.info(
-            "Select at least one share from your watchlist (or enter a custom ticker) to plot."
-        )
-    else:
-        tl_prices = fetch_timeline_prices(
-            tl_tickers, selected_tf, tl_start, tl_end
-        )
-        if tl_prices.empty:
-            st.warning(
-                "No price data available for the selected tickers or timeline range."
-            )
-        else:
-            if tl_mode == "Normalized (% Change)":
-                plot_df = pd.DataFrame(index=tl_prices.index)
-                for col in tl_prices.columns:
-                    s = tl_prices[col].dropna()
-                    if not s.empty:
-                        plot_df[col] = (
-                            (tl_prices[col] - s.iloc[0]) / s.iloc[0]
-                        ) * 100.0
-                y_label = "Return (%)"
-                hover_fmt = "%{y:+.2f}%"
-            else:
-                plot_df = tl_prices
-                y_label = "Price (USD / GBP)"
-                hover_fmt = "%{y:,.2f}"
-
-            fig = go.Figure()
-            for col in plot_df.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=plot_df.index,
-                        y=plot_df[col],
-                        mode="lines",
-                        name=col,
-                        connectgaps=True,
-                        hovertemplate=f"<b>{col}</b><br>%{{x}}<br>{hover_fmt}<extra></extra>",
-                    )
-                )
-
-            fig.update_layout(
-                hovermode="x unified",
-                xaxis_title="Date / Time",
-                yaxis_title=y_label,
-                height=520,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="left",
-                    x=0,
-                ),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("#### Period Performance Summary")
-            summary_rows = []
-            for col in tl_prices.columns:
-                s = tl_prices[col].dropna()
-                if len(s) >= 2:
-                    start_p = float(s.iloc[0])
-                    end_p = float(s.iloc[-1])
-                    diff = end_p - start_p
-                    pct = (diff / start_p) * 100.0 if start_p else 0.0
-                    curr_prefix = "£" if str(col).upper().endswith(".L") else "$"
-                    summary_rows.append(
-                        {
-                            "Ticker": col,
-                            "Currency": curr_prefix,
-                            "Start Price": round(start_p, 2),
-                            "Latest Price": round(end_p, 2),
-                            "Change": round(diff, 2),
-                            "Change (%)": round(pct, 2),
-                            "Period Low": round(float(s.min()), 2),
-                            "Period High": round(float(s.max()), 2),
-                        }
-                    )
-            if summary_rows:
-                st.dataframe(
-                    pd.DataFrame(summary_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
 # ==========================================
 # TAB 1: SINGLE STOCK ANALYSIS

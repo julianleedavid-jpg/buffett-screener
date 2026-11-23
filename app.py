@@ -284,7 +284,32 @@ def get_return_on_equity(info: dict) -> float | None:
         return round(roe, 2)
     return None
 
+def get_debt_ratio(info: dict, stock: yf.Ticker) -> float | None:
+    """Extracts Total Debt to Total Assets ratio from balance sheet if available."""
+    try:
+        bs = stock.quarterly_balance_sheet
+        if bs.empty:
+            bs = stock.balance_sheet
 
+        if not bs.empty:
+            total_debt = None
+            for key in ["Total Debt", "Short Long Term Debt", "Long Term Debt"]:
+                if key in bs.index:
+                    total_debt = bs.loc[key].iloc[0]
+                    break
+
+            total_assets = None
+            for key in ["Total Assets"]:
+                if key in bs.index:
+                    total_assets = bs.loc[key].iloc[0]
+                    break
+
+            if total_debt is not None and total_assets and total_assets > 0:
+                return round(float(total_debt) / float(total_assets), 2)
+    except Exception:
+        pass
+
+    return None
 def get_debt_to_equity(info: dict, stock: yf.Ticker) -> float | None:
     """Extracts Debt to Equity ratio, checking quarterly balance sheet as fallback."""
     dte = info.get("debtToEquity")
